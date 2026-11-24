@@ -29,8 +29,8 @@ android {
         applicationId = "com.loongphy.installguard"
         minSdk = 34
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.1.1"
         ndk {
             abiFilters += listOf("arm64-v8a")
         }
@@ -63,8 +63,8 @@ android {
         }
     }
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_11
-        targetCompatibility = JavaVersion.VERSION_11
+        sourceCompatibility = JavaVersion.VERSION_21
+        targetCompatibility = JavaVersion.VERSION_21
     }
     buildFeatures {
         compose = true
@@ -76,11 +76,13 @@ dependencies {
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.ui.tooling.preview)
-    implementation("androidx.compose.material:material-icons-core")
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.miuix.ui)
     implementation(libs.miuix.preference)
+    implementation(libs.miuix.icons)
+    implementation(libs.miuix.nav)
+    implementation(libs.miuix.blur)
     implementation(libs.shizuku.api)
     implementation(libs.shizuku.provider)
     debugImplementation(libs.androidx.compose.ui.tooling)

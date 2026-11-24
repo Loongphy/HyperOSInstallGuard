@@ -12,6 +12,12 @@ enum class Ns(val cli: String) {
     GLOBAL("global"), SECURE("secure"), SYSTEM("system")
 }
 
+enum class WatchCategory {
+    INSTALL_REVIEW,
+    ADB_PRIVACY,
+    INTERNAL_STATE,
+}
+
 /**
  * 一个被监控的系统设置项。
  * [expected] 是防护值（写入它即"关闭校验/放行"）；[restore] 是系统默认（有风险）值。
@@ -27,6 +33,7 @@ data class WatchItem(
     val okValues: Set<String> = setOf(expected),
     val onText: String = "",
     val offText: String = "",
+    val category: WatchCategory = WatchCategory.INSTALL_REVIEW,
 ) {
     fun isOk(current: String?) = (current?.trim() ?: "") in okValues ||
         (current == null && "null" in okValues)
@@ -35,7 +42,7 @@ data class WatchItem(
     fun statusText(current: String?): String = when {
         isOk(current) -> onText
         current?.trim() == restore -> offText
-        else -> "当前值 ${current ?: "（未设置）"}，非预期"
+        else -> "当前值 ${current ?: "（未设置）"}，建议恢复防护"
     }
 }
 
@@ -46,74 +53,84 @@ object SecureSettings {
     /** 开关类设置。开启 = 已按推荐配置（放行/关闭审查），关闭 = 系统默认。 */
     val items = listOf(
         WatchItem(
-            Ns.GLOBAL, "package_verifier_enable", "安装包验证器",
-            "安装前对 APK 做系统级安全验证",
+            Ns.GLOBAL, "package_verifier_enable", "跳过安装包验证",
+            "关闭安装前系统级 APK 安全验证",
             "0", "1",
-            onText = "已关闭，安装时不验证",
-            offText = "开启中，安装前会验证",
+            onText = "已关闭系统验证",
+            offText = "未防护 · 安装前会执行系统验证",
+            category = WatchCategory.INSTALL_REVIEW,
         ),
         WatchItem(
-            Ns.GLOBAL, "package_verifier_user_consent", "验证结果需确认",
-            "验证完成后是否再弹一次确认框（-1 = 不再询问）",
+            Ns.GLOBAL, "package_verifier_user_consent", "免除验证结果确认",
+            "不再弹出包验证完成后的二次确认框",
             "-1", "1",
-            onText = "不询问，验证后直接装",
-            offText = "开启中，会弹确认框",
+            onText = "已设为不再询问",
+            offText = "未防护 · 验证后会弹出确认框",
+            category = WatchCategory.INSTALL_REVIEW,
         ),
         WatchItem(
-            Ns.GLOBAL, "verifier_verify_adb_installs", "ADB 安装也验证",
-            "通过 adb install 安装时是否仍执行包验证",
-            "0", "1",
-            onText = "adb 安装跳过验证",
-            offText = "adb 安装也会验证",
-        ),
-        WatchItem(
-            Ns.GLOBAL, "upload_apk_enable", "APK 信息上传",
-            "安装时把 APK 信息上传到小米服务器（纯隐私项，云端会回滚）",
-            "0", "1",
-            onText = "已关闭，不上传",
-            offText = "开启中，安装信息会上传小米",
-        ),
-        WatchItem(
-            Ns.GLOBAL, "adb_install_need_confirm", "ADB 安装弹确认框",
-            "adb install 时是否在手机屏幕上弹确认框",
-            "0", "1",
-            onText = "不弹框，静默安装",
-            offText = "开启中，会弹确认框",
-        ),
-        WatchItem(
-            Ns.SECURE, "install_non_market_apps", "允许未知来源安装",
-            "是否允许安装应用商店以外来源的 APK",
-            "1", "0",
-            onText = "允许，可自由安装 APK",
-            offText = "禁止，只能走应用商店",
-        ),
-        WatchItem(
-            Ns.SECURE, "installer_full_safe_version", "安装器完整安全校验",
-            "小米安装器的完整安全审查流程（云端会回滚）",
+            Ns.SECURE, "installer_full_safe_version", "跳过完整安全审查",
+            "关闭小米安装器完整安全审查流程",
             "0", "1",
             onText = "已关闭完整审查",
-            offText = "开启中，走完整审查",
+            offText = "未防护 · 启用完整审查（易被云端回滚）",
+            category = WatchCategory.INSTALL_REVIEW,
         ),
         WatchItem(
             Ns.SECURE, "com.miui.packageinstaller_setting_key_show_security_warning",
-            "安装安全警告", "安装时是否显示“存在风险”类安全警告",
+            "屏蔽安装风险警告", "隐藏安装界面的“存在风险”类安全提示",
             "0", "1",
-            onText = "不显示警告",
-            offText = "开启中，会显示安全警告",
+            onText = "已屏蔽风险警告",
+            offText = "未防护 · 安装时会显示安全警告",
+            category = WatchCategory.INSTALL_REVIEW,
         ),
         WatchItem(
-            Ns.SECURE, "package_verifier_state", "验证器内部标志",
-            "系统自维护的标志位，通常为 0，无需理解",
+            Ns.SYSTEM, "virus_scan_install", "关闭安装病毒扫描",
+            "跳过安全中心在安装时的联网病毒查杀",
             "0", "1",
-            onText = "0（正常）",
-            offText = "非 0，建议修复回 0",
+            onText = "已关闭安装查杀",
+            offText = "未防护 · 安装时会联网扫毒",
+            category = WatchCategory.INSTALL_REVIEW,
         ),
         WatchItem(
-            Ns.SYSTEM, "virus_scan_install", "安装病毒扫描",
-            "安全中心在安装时做病毒云查杀",
+            Ns.SECURE, "install_non_market_apps", "允许未知来源安装",
+            "允许自由安装应用商店以外来源的 APK",
+            "1", "0",
+            onText = "已允许未知来源",
+            offText = "未防护 · 仅允许应用商店安装",
+            category = WatchCategory.INSTALL_REVIEW,
+        ),
+        WatchItem(
+            Ns.GLOBAL, "verifier_verify_adb_installs", "ADB 安装免验证",
+            "通过 ADB 安装应用时跳过系统包验证",
             "0", "1",
-            onText = "已关闭，安装不扫描",
-            offText = "开启中，安装会扫毒",
+            onText = "ADB 安装已跳过验证",
+            offText = "未防护 · ADB 安装仍会执行验证",
+            category = WatchCategory.ADB_PRIVACY,
+        ),
+        WatchItem(
+            Ns.GLOBAL, "adb_install_need_confirm", "ADB 免确认静默安装",
+            "免除 ADB 安装时手机屏幕弹窗确认",
+            "0", "1",
+            onText = "ADB 已启用静默安装",
+            offText = "未防护 · ADB 安装需屏幕手动确认",
+            category = WatchCategory.ADB_PRIVACY,
+        ),
+        WatchItem(
+            Ns.GLOBAL, "upload_apk_enable", "禁止上传 APK 信息",
+            "阻止安装时将应用信息上传至小米云端",
+            "0", "1",
+            onText = "已阻止隐私上传",
+            offText = "未防护 · 安装信息会上传至云端",
+            category = WatchCategory.ADB_PRIVACY,
+        ),
+        WatchItem(
+            Ns.SECURE, "package_verifier_state", "锁定验证器内部标志",
+            "保持系统包验证器状态位为正常值 0",
+            "0", "1",
+            onText = "正常（0）",
+            offText = "状态位非 0，建议恢复为 0",
+            category = WatchCategory.INTERNAL_STATE,
         ),
     )
 
