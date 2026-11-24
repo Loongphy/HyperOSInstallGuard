@@ -101,7 +101,7 @@ class GuardService : Service() {
     private fun buildNotif(): Notification {
         val total = getSharedPreferences(PREFS, MODE_PRIVATE).getInt(PREF_FIXES, 0)
         return Notification.Builder(this, CHANNEL)
-            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setSmallIcon(R.drawable.ic_stat_guard)
             .setContentTitle("安装守护运行中")
             .setContentText(
                 if (total == 0) "正在监视云端回滚"
