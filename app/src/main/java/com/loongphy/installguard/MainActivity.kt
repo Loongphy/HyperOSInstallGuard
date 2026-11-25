@@ -6,8 +6,11 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.database.ContentObserver
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.os.Process
 import android.provider.Settings
@@ -35,6 +38,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -112,6 +116,7 @@ class MonitorState(private val activity: ComponentActivity) {
     val values = mutableStateMapOf<String, String?>()
     var initialLoaded by mutableStateOf(false)
     var secureWritable by mutableStateOf(false)
+    var notificationsGranted by mutableStateOf(true)
     var batteryUnrestricted by mutableStateOf(true)
     var busy by mutableStateOf(false)
     var hashIndex by mutableStateOf<Map<String, String>?>(null)
@@ -120,16 +125,47 @@ class MonitorState(private val activity: ComponentActivity) {
     var guardActive by mutableStateOf(false)
     var guardFixes by mutableStateOf(0)
     private val resolver get() = activity.contentResolver
+    private val observerHandler = Handler(Looper.getMainLooper())
+    private val settingsObservers = mutableListOf<ContentObserver>()
+    private var observingSettings = false
+
+    /** 前台停留期间同步观察设置变化：后台守护修复后，界面开关能立即跟着恢复。 */
+    fun startObserving() {
+        if (observingSettings) return
+        observingSettings = true
+        Guardian.watched.forEach { item ->
+            val observer = object : ContentObserver(observerHandler) {
+                override fun onChange(selfChange: Boolean) {
+                    activity.lifecycleScope.launch(Dispatchers.IO) {
+                        values[item.key] = SecureSettings.read(resolver, item)
+                    }
+                }
+            }
+            runCatching {
+                resolver.registerContentObserver(Guardian.uriFor(item), false, observer)
+                settingsObservers.add(observer)
+            }
+        }
+    }
+
+    fun stopObserving() {
+        settingsObservers.forEach { resolver.unregisterContentObserver(it) }
+        settingsObservers.clear()
+        observingSettings = false
+    }
 
     fun refreshGuard() {
         val p = activity.getSharedPreferences(GuardService.PREFS, Context.MODE_PRIVATE)
         val enabled = p.getBoolean(GuardService.PREF_ENABLED, false)
-        if (enabled && !GuardService.running) {
-            runCatching {
-                activity.startForegroundService(
-                    Intent(activity, GuardService::class.java)
-                        .setAction(GuardService.ACTION_START),
-                )
+        if (enabled) {
+            GuardScheduler.ensureScheduled(activity)
+            if (!GuardService.running) {
+                runCatching {
+                    activity.startForegroundService(
+                        Intent(activity, GuardService::class.java)
+                            .setAction(GuardService.ACTION_START),
+                    )
+                }
             }
         }
         guardActive = enabled
@@ -146,11 +182,13 @@ class MonitorState(private val activity: ComponentActivity) {
                     values[item.key]?.let { saveSnap(item, it) }
                 }
             }
+            GuardScheduler.ensureScheduled(activity)
             activity.startForegroundService(
                 Intent(activity, GuardService::class.java)
                     .setAction(GuardService.ACTION_START),
             )
         } else {
+            GuardScheduler.cancelAll(activity)
             activity.startService(
                 Intent(activity, GuardService::class.java)
                     .setAction(GuardService.ACTION_STOP),
@@ -160,15 +198,19 @@ class MonitorState(private val activity: ComponentActivity) {
     }
 
     suspend fun refresh() = withContext(Dispatchers.IO) {
+        refreshGuard()
         (SecureSettings.items + SecureSettings.listItems).forEach {
             values[it.key] = SecureSettings.read(resolver, it)
         }
         secureWritable = activity.checkSelfPermission(Manifest.permission.WRITE_SECURE_SETTINGS) ==
             PackageManager.PERMISSION_GRANTED
+        notificationsGranted = activity.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
         val pm = activity.getSystemService(Context.POWER_SERVICE) as? PowerManager
         batteryUnrestricted = pm?.isIgnoringBatteryOptimizations(activity.packageName) ?: true
         ShizukuHelper.refresh()
-        refreshGuard()
+        guardFixes = activity.getSharedPreferences(GuardService.PREFS, Context.MODE_PRIVATE)
+            .getInt(GuardService.PREF_FIXES, 0)
         initialLoaded = true
     }
 
@@ -258,6 +300,10 @@ class MonitorState(private val activity: ComponentActivity) {
             .onFailure { openAppInfo() }
     }
 
+    fun requestNotifications() {
+        activity.requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 7001)
+    }
+
     fun copyToClipboard(label: String, text: String) {
         val cm = activity.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
         cm?.setPrimaryClip(ClipData.newPlainText(label, text))
@@ -293,7 +339,13 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         ShizukuHelper.refresh()
+        monitor.startObserving()
         lifecycleScope.launch { monitor.refresh() }
+    }
+
+    override fun onPause() {
+        monitor.stopObserving()
+        super.onPause()
     }
 }
 
@@ -503,12 +555,14 @@ private fun MainPage(
                     EnvironmentGuardCard(
                         shizuku = shizuku,
                         secureWritable = state.secureWritable,
+                        notificationsGranted = state.notificationsGranted,
                         batteryUnrestricted = state.batteryUnrestricted,
                         guardActive = state.guardActive,
                         guardFixes = state.guardFixes,
                         busy = state.busy,
                         onToggleGuard = { state.setGuard(it) },
                         onRequestShizuku = { ShizukuHelper.requestPermission() },
+                        onRequestNotifications = { state.requestNotifications() },
                         onGrantSecure = {
                             scope.launch {
                                 state.busy = true
@@ -706,12 +760,14 @@ private fun StatusTag(
 private fun EnvironmentGuardCard(
     shizuku: ShizukuStatus,
     secureWritable: Boolean,
+    notificationsGranted: Boolean,
     batteryUnrestricted: Boolean,
     guardActive: Boolean,
     guardFixes: Int,
     busy: Boolean,
     onToggleGuard: (Boolean) -> Unit,
     onRequestShizuku: () -> Unit,
+    onRequestNotifications: () -> Unit,
     onGrantSecure: () -> Unit,
     onOpenKeepAlive: () -> Unit,
 ) {
@@ -719,17 +775,34 @@ private fun EnvironmentGuardCard(
     val secondary = MiuixTheme.colorScheme.onSurfaceVariantActions
 
     Card(modifier = Modifier.padding(horizontal = 12.dp)) {
-        SwitchPreference(
-            title = "后台自动守护",
-            summary = if (guardActive) {
-                "监听设置变更 · 已自动恢复回滚 $guardFixes 次"
-            } else {
-                "云端改回受保护设置时立即自动写回"
-            },
-            checked = guardActive,
-            onCheckedChange = onToggleGuard,
-            enabled = !busy,
-        )
+        key(guardActive) {
+            SwitchPreference(
+                title = "后台自动守护",
+                summary = if (guardActive) {
+                    "系统级监听设置变更 · 已自动恢复回滚 $guardFixes 次"
+                } else {
+                    "云端改回受保护设置时，无需打开应用也会自动写回"
+                },
+                checked = guardActive,
+                onCheckedChange = onToggleGuard,
+                enabled = !busy,
+            )
+        }
+
+        if (guardActive && !notificationsGranted) {
+            ArrowPreference(
+                title = "前台服务通知",
+                summary = "通知权限未授予，守护运行状态不会显示在通知栏",
+                endActions = {
+                    Text(
+                        text = "去授权",
+                        style = MiuixTheme.textStyles.body2,
+                        color = primary,
+                    )
+                },
+                onClick = onRequestNotifications,
+            )
+        }
 
         if (shizuku == ShizukuStatus.NEED_AUTH) {
             ArrowPreference(
@@ -820,18 +893,20 @@ private fun ProtectionSwitchRow(
     onToggle: (Boolean) -> Unit,
 ) {
     val ok = !initialLoaded || item.isOk(current)
-    SwitchPreference(
-        title = item.title,
-        summary = if (ok) item.summary else item.statusText(current),
-        summaryColor = if (ok) {
-            BasicComponentDefaults.summaryColor()
-        } else {
-            BasicComponentDefaults.summaryColor(color = MiuixTheme.colorScheme.error)
-        },
-        checked = ok,
-        onCheckedChange = onToggle,
-        enabled = !busy,
-    )
+    key(ok) {
+        SwitchPreference(
+            title = item.title,
+            summary = if (ok) item.summary else item.statusText(current),
+            summaryColor = if (ok) {
+                BasicComponentDefaults.summaryColor()
+            } else {
+                BasicComponentDefaults.summaryColor(color = MiuixTheme.colorScheme.error)
+            },
+            checked = ok,
+            onCheckedChange = onToggle,
+            enabled = !busy,
+        )
+    }
 }
 
 @Composable
@@ -849,7 +924,7 @@ private fun KeepAliveBottomSheet(
     ) {
         Column(modifier = Modifier.padding(bottom = 16.dp)) {
             Text(
-                text = "HyperOS 的后台冻结机制会延缓设置变更回调。完成以下三项配置后，云端回滚可在第一时间自动修复：",
+                text = "系统级监听即使应用进程被杀也会拉起修复；以下配置可减少 HyperOS 冻结造成的延迟，并让前台服务保持低延迟实时修复：",
                 style = MiuixTheme.textStyles.body2,
                 color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
                 modifier = Modifier.padding(bottom = 12.dp),

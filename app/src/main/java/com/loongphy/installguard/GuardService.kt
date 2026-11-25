@@ -8,13 +8,11 @@ import android.content.BroadcastReceiver
 import android.content.ContentResolver
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.database.ContentObserver
-import android.net.Uri
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.provider.Settings
-import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -22,14 +20,11 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 
 /**
- * 前台服务：监视所有受监控的设置项。
- * 使用 ContentObserver（事件驱动，不轮询）——耗电几乎为零：
- * 只有 SettingsProvider 通知变更时进程才被唤醒。
- * 每 5 分钟做一次兜底扫描，覆盖可能丢失的通知。
+ * 前台服务：进程存活时对受监控设置项做事件驱动实时修复。
  *
- * 目标值取用户在界面最后一次设定的快照（snap_<key>），
- * 没有快照的键沿用默认防护值。云端/MIUI 把某个键改回别的值时，
- * observer 触发，服务立即写回目标值。
+ * 它只是第一层防线：HyperOS 可能停止或冻结进程，因此持续守护由
+ * GuardScheduler 的 TriggerContentUri JobService 承担；即使本进程死亡，
+ * 系统也会在设置变化后拉起 GuardJobService 修复。
  */
 class GuardService : Service() {
 
@@ -39,10 +34,10 @@ class GuardService : Service() {
         const val PREFS = "guard_prefs"
         const val PREF_ENABLED = "guard_enabled"
         const val PREF_FIXES = "guard_fixes"
+        const val PREF_LAST_FIX_AT = "guard_last_fix_at"
         const val SNAP_PREFIX = "snap_"
         private const val NOTIF_ID = 7001
         private const val CHANNEL = "guard"
-        private const val TAG = "GuardService"
         private const val SWEEP_MS = 5 * 60 * 1000L
 
         var running = false
@@ -54,7 +49,7 @@ class GuardService : Service() {
     private val handler = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val resolver: ContentResolver get() = contentResolver
-    private val watched = SecureSettings.items + SecureSettings.listItems
+    private val watched = Guardian.watched
     private val observers = mutableListOf<ContentObserver>()
     private var fixesThisSession = 0
 
@@ -69,11 +64,18 @@ class GuardService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        if (GuardScheduler.isGuardEnabled(this)) {
+            GuardScheduler.ensureScheduled(this)
+        }
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         nm.createNotificationChannel(
             NotificationChannel(CHANNEL, "安装守护", NotificationManager.IMPORTANCE_MIN)
         )
-        startForeground(NOTIF_ID, buildNotif())
+        startForeground(
+            NOTIF_ID,
+            buildNotif(),
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+        )
         registerObservers()
         handler.postDelayed(sweep, SWEEP_MS)
         running = true
@@ -116,20 +118,6 @@ class GuardService : Service() {
         nm.notify(NOTIF_ID, buildNotif())
     }
 
-    private fun uriFor(item: WatchItem): Uri = when (item.ns) {
-        Ns.GLOBAL -> Settings.Global.getUriFor(item.key)
-        Ns.SECURE -> Settings.Secure.getUriFor(item.key)
-        Ns.SYSTEM -> Settings.System.getUriFor(item.key)
-    }
-
-    private fun readFor(item: WatchItem): String? = runCatching {
-        when (item.ns) {
-            Ns.GLOBAL -> Settings.Global.getString(resolver, item.key)
-            Ns.SECURE -> Settings.Secure.getString(resolver, item.key)
-            Ns.SYSTEM -> Settings.System.getString(resolver, item.key)
-        }
-    }.getOrNull()
-
     private fun registerObservers() {
         watched.forEach { item ->
             val obs = object : ContentObserver(handler) {
@@ -138,38 +126,18 @@ class GuardService : Service() {
                 }
             }
             runCatching {
-                resolver.registerContentObserver(uriFor(item), false, obs)
+                resolver.registerContentObserver(Guardian.uriFor(item), false, obs)
                 observers.add(obs)
             }
         }
     }
 
-    /**
-     * 检查一个键：当前值与目标不符就写回。
-     * 目标 = 用户手动设定的快照；无快照时用默认防护值（isOk 判定）。
-     * 写路径走 SecureSettings.write —— 直写失败时 Shizuku 兜底，
-     * 覆盖 system 命名空间这类直写无权限的键。
-     */
     private fun checkItem(item: WatchItem) {
-        val current = readFor(item)
-        val p = getSharedPreferences(PREFS, MODE_PRIVATE)
-        val snap = p.getString(SNAP_PREFIX + item.key, null)
-        val target = snap ?: item.expected
-        val okNow = if (snap != null) {
-            current?.trim() == snap.trim()
-        } else {
-            item.isOk(current)
-        }
-        if (!okNow) {
-            scope.launch {
-                if (SecureSettings.write(resolver, item, target)) {
-                    fixesThisSession++
-                    lastFixAt = System.currentTimeMillis()
-                    p.edit().putInt(PREF_FIXES, p.getInt(PREF_FIXES, 0) + 1).apply()
-                    updateNotif()
-                } else {
-                    Log.w(TAG, "fix failed: ${item.ns}/${item.key} -> $target")
-                }
+        scope.launch {
+            if (Guardian.checkItem(this@GuardService, item)) {
+                fixesThisSession++
+                lastFixAt = System.currentTimeMillis()
+                updateNotif()
             }
         }
     }
@@ -180,19 +148,24 @@ class GuardService : Service() {
     }
 }
 
-/** Rearranque del guard tras boot si estaba activado. */
+/** 开机或应用更新后重新布防；JobScheduler 路径不依赖前台服务能否启动。 */
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
+        if (intent.action != Intent.ACTION_BOOT_COMPLETED &&
+            intent.action != Intent.ACTION_MY_PACKAGE_REPLACED
+        ) {
+            return
+        }
         val enabled = context.getSharedPreferences(GuardService.PREFS, Context.MODE_PRIVATE)
             .getBoolean(GuardService.PREF_ENABLED, false)
-        if (enabled) {
-            runCatching {
-                context.startForegroundService(
-                    Intent(context, GuardService::class.java)
-                        .setAction(GuardService.ACTION_START),
-                )
-            }
+        if (!enabled) return
+
+        GuardScheduler.ensureScheduled(context)
+        runCatching {
+            context.startForegroundService(
+                Intent(context, GuardService::class.java)
+                    .setAction(GuardService.ACTION_START),
+            )
         }
     }
 }
